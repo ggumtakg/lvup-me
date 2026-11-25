@@ -119,8 +119,14 @@ interface QuizDao {
     @Query("SELECT * FROM quiz_questions WHERE subjectId = :subjectId")
     suspend fun getBySubject(subjectId: Long): List<QuizQuestionEntity>
 
+    @Query("SELECT * FROM quiz_questions WHERE subjectId = :subjectId")
+    fun observeBySubject(subjectId: Long): Flow<List<QuizQuestionEntity>>
+
     @Query("SELECT * FROM quiz_questions ORDER BY id ASC")
     suspend fun getAll(): List<QuizQuestionEntity>
+
+    @Query("SELECT * FROM quiz_questions ORDER BY id ASC")
+    fun observeAll(): Flow<List<QuizQuestionEntity>>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(question: QuizQuestionEntity): Long

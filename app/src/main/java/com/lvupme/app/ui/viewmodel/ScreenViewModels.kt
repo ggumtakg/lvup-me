@@ -13,12 +13,14 @@ import com.lvupme.app.data.local.CurriculumUnitEntity
 import com.lvupme.app.data.local.ExamSessionEntity
 import com.lvupme.app.data.local.ExamType
 import com.lvupme.app.data.local.QuestionType
+import com.lvupme.app.data.local.UnitStatus
 import com.lvupme.app.data.remote.ChatMessageDto
 import com.lvupme.app.data.remote.LevelEvaluationDto
 import com.lvupme.app.data.remote.LevelTestQuestionDto
 import com.lvupme.app.domain.AnswerGrader
 import com.lvupme.app.domain.ScheduledQuestion
 import com.lvupme.app.ui.onboarding.OnboardingProposal
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
@@ -259,17 +261,59 @@ private data class PendingStudyCommit(
 class StudyViewModel(
     private val container: AppContainer,
     val subjectId: Long,
-    initialPinnedCardId: Long?
+    initialPinnedCardId: Long?,
+    initialFocusUnitId: Long? = null
 ) : ViewModel() {
     private val repo = container.learningRepository
     private val json = Json { ignoreUnknownKeys = true }
+
+    var focusUnitId by mutableStateOf(initialFocusUnitId)
+        private set
+    var isPastUnitReviewMode by mutableStateOf(false)
+        private set
 
     var activeUnit by mutableStateOf<CurriculumUnitEntity?>(null)
         private set
     var unitReadiness by mutableStateOf(0f)
         private set
+    var unitPracticedCount by mutableIntStateOf(0)
+        private set
+    var unitTotalCards by mutableIntStateOf(0)
+        private set
     var allUnitsCompleted by mutableStateOf(false)
         private set
+
+    // 100% completion gate for active unit (방식 A)
+    var showUnitCompleteGate by mutableStateOf(false)
+        private set
+    var continueAfterUnitComplete by mutableStateOf(false)
+        private set
+
+    // Focused single-round review state for completed past units (방식 1)
+    private val reviewRoundCoveredIds = mutableSetOf<Long>()
+    var reviewRoundTargetTotal by mutableIntStateOf(0)
+        private set
+    var reviewRoundCompletedCount by mutableIntStateOf(0)
+        private set
+    var reviewRoundCorrectCount by mutableIntStateOf(0)
+        private set
+    var showPastReviewCompleteGate by mutableStateOf(false)
+        private set
+
+    val effectiveReviewRoundTotal: Int
+        get() = if (reviewRoundTargetTotal > 0) reviewRoundTargetTotal else unitTotalCards
+
+    val isReadyToFinishActiveUnit: Boolean
+        get() = !isPastUnitReviewMode &&
+            !allUnitsCompleted &&
+            unitTotalCards > 0 &&
+            unitReadiness >= 1f &&
+            !continueAfterUnitComplete
+
+    val isReadyToFinishPastReviewRound: Boolean
+        get() = isPastUnitReviewMode &&
+            effectiveReviewRoundTotal > 0 &&
+            reviewRoundCompletedCount >= effectiveReviewRoundTotal
 
     var isLoading by mutableStateOf(true)
         private set
@@ -280,6 +324,7 @@ class StudyViewModel(
         private set
     var comboStreak by mutableIntStateOf(0)
         private set
+    private var comboBeforeAnswer = 0
 
     private var historyLoaded = false
     private var sessionIndex = 0
@@ -308,12 +353,63 @@ class StudyViewModel(
         private set
 
     private var pendingCommit: PendingStudyCommit? = null
-    private var activeCommitJob: Job? = null
+    private var activeCommitDeferred: Deferred<Pair<Boolean, com.lvupme.app.data.repository.UnitReadiness>>? = null
+    private var recheckJob: Job? = null
     private var loadJob: Job? = null
+    private var questionToken = 0L
+    private var modeToken = 0L
     private var lastAppliedPinnedId: Long? = initialPinnedCardId
+    private var lastAppliedFocusUnitId: Long? = initialFocusUnitId
+    private var observedInitialUnits = false
 
     init {
+        observeCurriculumUnitChanges()
         loadNextQuestion(prefetchIfMissing = false)
+    }
+
+    /**
+     * Reactively tracks Room unit status updates (e.g., passing a checkpoint exam on ExamScreen
+     * even if the user navigates back before completeExam finishes).
+     */
+    private fun observeCurriculumUnitChanges() {
+        viewModelScope.launch {
+            repo.observeUnits(subjectId).collect { units ->
+                if (units.isEmpty()) return@collect
+                val allDone = units.all { it.status == UnitStatus.COMPLETED }
+                val latestActive = units.firstOrNull { it.status == UnitStatus.ACTIVE }
+                if (!observedInitialUnits) {
+                    observedInitialUnits = true
+                    return@collect
+                }
+                val completionChanged = allDone != allUnitsCompleted
+                allUnitsCompleted = allDone
+
+                if (!isPastUnitReviewMode && !isLoading) {
+                    val activeUnitChanged = latestActive != null && latestActive.id != activeUnit?.id
+                    if (activeUnitChanged || completionChanged) {
+                        modeToken++
+                        continueAfterUnitComplete = false
+                        showUnitCompleteGate = false
+                        historyLoaded = false
+                        loadNextQuestion(prefetchIfMissing = false, autoSpeak = false)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun resetReviewRoundState() {
+        reviewRoundCoveredIds.clear()
+        reviewRoundTargetTotal = 0
+        reviewRoundCompletedCount = 0
+        reviewRoundCorrectCount = 0
+        showPastReviewCompleteGate = false
+    }
+
+    private fun cancelInFlightRecheck() {
+        recheckJob?.cancel()
+        recheckJob = null
+        isAiRechecking = false
     }
 
     fun applyPinnedCard(cardId: Long?) {
@@ -323,13 +419,87 @@ class StudyViewModel(
             lastAppliedPinnedId = cardId
             return
         }
+        cancelInFlightRecheck()
         lastAppliedPinnedId = cardId
+        lastAppliedFocusUnitId = null
+        modeToken++
+        focusUnitId = null
+        resetReviewRoundState()
+        showUnitCompleteGate = false
+        continueAfterUnitComplete = false
         nextPinnedCardId = cardId
         loadNextQuestion(prefetchIfMissing = false)
     }
 
+    fun applyFocusUnitArg(unitId: Long?) {
+        if (unitId == lastAppliedFocusUnitId) return
+        lastAppliedFocusUnitId = unitId
+        switchToUnit(unitId)
+    }
+
+    fun switchToUnit(unitId: Long?) {
+        cancelInFlightRecheck()
+        modeToken++
+        focusUnitId = unitId
+        lastAppliedFocusUnitId = unitId
+        resetReviewRoundState()
+        showUnitCompleteGate = false
+        continueAfterUnitComplete = false
+        nextPinnedCardId = null
+        historyLoaded = false
+        recentCardIds.clear()
+        recentPastCardIds.clear()
+        recentTypes.clear()
+        loadNextQuestion(prefetchIfMissing = false)
+    }
+
+    fun continueExtraPracticeAfterUnitComplete() {
+        continueAfterUnitComplete = true
+        showUnitCompleteGate = false
+        loadNextQuestion(prefetchIfMissing = false)
+    }
+
+    fun restartPastReviewRound() {
+        resetReviewRoundState()
+        recentCardIds.clear()
+        loadNextQuestion(prefetchIfMissing = false)
+    }
+
+    /**
+     * Immediately flushes any deferred short-answer commit on appScope before navigating away
+     * (e.g., to ExamScreen while StudyScreen stays on the back stack).
+     */
+    fun flushPendingCommit() {
+        cancelInFlightRecheck()
+        val pending = pendingCommit ?: return
+        pendingCommit = null
+        offerAiRecheck = false
+        val targetUnitSnapshot = focusUnitId
+        val deferred = container.appScope.async {
+            val generated = repo.recordStudyAnswer(pending.scheduled, pending.isCorrect, pending.userInput)
+            val readiness = repo.getUnitReadiness(subjectId, targetUnitId = targetUnitSnapshot)
+            generated to readiness
+        }
+        activeCommitDeferred = deferred
+    }
+
     fun toggleLessonCard() {
         showLessonCard = !showLessonCard
+    }
+
+    private fun applyReadiness(readiness: com.lvupme.app.data.repository.UnitReadiness) {
+        activeUnit = readiness.unit
+        unitReadiness = readiness.readiness
+        unitPracticedCount = readiness.practicedCards
+        unitTotalCards = readiness.totalCards
+        allUnitsCompleted = readiness.allUnitsCompleted
+        isPastUnitReviewMode = readiness.isFocusUnitReview
+        if (focusUnitId != null && (!readiness.isFocusUnitReview || readiness.unit?.id != focusUnitId)) {
+            focusUnitId = null
+        }
+        if (readiness.isFocusUnitReview && reviewRoundTargetTotal == 0 && readiness.totalCards > 0) {
+            reviewRoundTargetTotal = readiness.totalCards
+        }
     }
 
     /**
@@ -338,28 +508,32 @@ class StudyViewModel(
     private suspend fun ensurePendingCommitted() {
         val pending = pendingCommit ?: return
         pendingCommit = null
+        val targetUnitSnapshot = focusUnitId
+        val modeSnap = modeToken
+        val qSnap = questionToken
         val deferred = container.appScope.async {
             val generated = repo.recordStudyAnswer(pending.scheduled, pending.isCorrect, pending.userInput)
-            val readiness = repo.getUnitReadiness(subjectId)
+            val readiness = repo.getUnitReadiness(subjectId, targetUnitId = targetUnitSnapshot)
             generated to readiness
         }
-        activeCommitJob = deferred
+        activeCommitDeferred = deferred
         val (generated, readiness) = deferred.await()
-        if (generated) {
+        if (activeCommitDeferred === deferred) activeCommitDeferred = null
+        if (qSnap == questionToken && generated) {
             reinforcementCreated = true
         }
-        activeUnit = readiness.unit
-        unitReadiness = readiness.readiness
-        allUnitsCompleted = readiness.allUnitsCompleted
+        if (modeSnap == modeToken) {
+            applyReadiness(readiness)
+        }
     }
 
-    fun loadNextQuestion(prefetchIfMissing: Boolean = false) {
+    fun loadNextQuestion(prefetchIfMissing: Boolean = false, autoSpeak: Boolean = true) {
+        cancelInFlightRecheck()
         loadJob?.cancel()
+        val myQuestionToken = ++questionToken
+        val myModeToken = modeToken
         loadJob = viewModelScope.launch {
-            // Ensure any deferred/in-flight answer commit finishes BEFORE selecting next card
-            ensurePendingCommitted()
-            activeCommitJob?.join()
-
+            // Show loading immediately before awaiting any pending DB/AI reinforcement commit
             isLoading = true
             errorMsg = null
             answered = false
@@ -369,6 +543,15 @@ class StudyViewModel(
             offerAiRecheck = false
             reinforcementCreated = false
             showLessonCard = false
+
+            // Ensure any deferred/in-flight answer commit finishes BEFORE selecting next card
+            ensurePendingCommitted()
+            activeCommitDeferred?.let { deferred ->
+                runCatching { deferred.await() }
+                if (activeCommitDeferred === deferred) activeCommitDeferred = null
+            }
+
+            if (myQuestionToken != questionToken || myModeToken != modeToken) return@launch
 
             runCatching {
                 if (!historyLoaded) {
@@ -383,14 +566,48 @@ class StudyViewModel(
                     historyLoaded = true
                 }
 
+                val targetUnit = focusUnitId
                 if (prefetchIfMissing) {
-                    repo.ensureActiveUnitPrefetched(subjectId)
+                    if (targetUnit != null) {
+                        repo.ensureUnitPrefetched(subjectId, targetUnit)
+                    } else {
+                        repo.ensureActiveUnitPrefetched(subjectId)
+                    }
                 }
 
-                val readiness = repo.getUnitReadiness(subjectId)
-                activeUnit = readiness.unit
-                unitReadiness = readiness.readiness
-                allUnitsCompleted = readiness.allUnitsCompleted
+                var readiness = repo.getUnitReadiness(subjectId, targetUnitId = targetUnit)
+                applyReadiness(readiness)
+
+                val pinnedNow = nextPinnedCardId
+                val roundTarget = effectiveReviewRoundTotal
+
+                // Gate 1: Focused past-unit review round completed (snapshot target prevents mid-round shift)
+                if (isPastUnitReviewMode && roundTarget > 0 && reviewRoundCompletedCount >= roundTarget && pinnedNow == null) {
+                    showPastReviewCompleteGate = true
+                    showUnitCompleteGate = false
+                    currentScheduled = null
+                    return@runCatching null to true
+                }
+
+                // Gate 2: Active unit reached 100% readiness (방식 A)
+                if (!isPastUnitReviewMode &&
+                    !allUnitsCompleted &&
+                    unitTotalCards > 0 &&
+                    unitReadiness >= 1f &&
+                    !continueAfterUnitComplete &&
+                    pinnedNow == null
+                ) {
+                    showUnitCompleteGate = true
+                    showPastReviewCompleteGate = false
+                    currentScheduled = null
+                    return@runCatching null to true
+                }
+
+                showUnitCompleteGate = false
+                showPastReviewCompleteGate = false
+
+                val effectiveFocusId = if (isPastUnitReviewMode) focusUnitId else null
+                val coveredSnapshot = if (isPastUnitReviewMode) reviewRoundCoveredIds.toSet() else emptySet()
 
                 var next = repo.nextStudyQuestion(
                     subjectId = subjectId,
@@ -398,22 +615,37 @@ class StudyViewModel(
                     recentCardIds = recentCardIds,
                     recentQuestionTypes = recentTypes,
                     recentPastCardIds = recentPastCardIds,
-                    pinnedCardId = nextPinnedCardId
+                    pinnedCardId = pinnedNow,
+                    focusUnitId = effectiveFocusId,
+                    sessionCoveredCardIds = coveredSnapshot
                 )
                 if (next == null) {
-                    repo.ensureActiveUnitPrefetched(subjectId)
+                    if (effectiveFocusId != null) {
+                        repo.ensureUnitPrefetched(subjectId, effectiveFocusId)
+                    } else {
+                        repo.ensureActiveUnitPrefetched(subjectId)
+                    }
+                    readiness = repo.getUnitReadiness(subjectId, targetUnitId = focusUnitId)
+                    applyReadiness(readiness)
                     next = repo.nextStudyQuestion(
                         subjectId = subjectId,
                         sessionIndex = sessionIndex,
                         recentCardIds = recentCardIds,
                         recentQuestionTypes = recentTypes,
                         recentPastCardIds = recentPastCardIds,
-                        pinnedCardId = nextPinnedCardId
+                        pinnedCardId = pinnedNow,
+                        focusUnitId = if (isPastUnitReviewMode) focusUnitId else null,
+                        sessionCoveredCardIds = if (isPastUnitReviewMode) reviewRoundCoveredIds.toSet() else emptySet()
                     )
                 }
                 nextPinnedCardId = null
-                next
-            }.onSuccess { next ->
+                next to false
+            }.onSuccess { (next, gated) ->
+                if (myQuestionToken != questionToken || myModeToken != modeToken) return@onSuccess
+                if (gated) {
+                    isLoading = false
+                    return@onSuccess
+                }
                 currentScheduled = next
                 if (next != null) {
                     val choices = runCatching {
@@ -424,7 +656,7 @@ class StudyViewModel(
                     val sub = container.database.subjectDao().getById(subjectId)
                     val settings = container.settingsRepository.getSettings()
                     val speakText = next.card.ttsText.ifBlank { next.card.title }
-                    if (sub != null && sub.ttsEnabled && settings.ttsAutoPlayDefault && speakText.isNotBlank()) {
+                    if (autoSpeak && sub != null && sub.ttsEnabled && settings.ttsAutoPlayDefault && speakText.isNotBlank()) {
                         container.ttsHelper.speak(speakText, sub.ttsLocale, settings.ttsSpeechRate)
                     }
                 } else {
@@ -432,6 +664,7 @@ class StudyViewModel(
                 }
                 isLoading = false
             }.onFailure { e ->
+                if (myQuestionToken != questionToken || myModeToken != modeToken) return@onFailure
                 errorMsg = e.message ?: "학습 카드를 불러오지 못했습니다."
                 isLoading = false
             }
@@ -470,6 +703,7 @@ class StudyViewModel(
     ) {
         answered = true
         isCorrect = correct
+        comboBeforeAnswer = comboStreak
         comboStreak = if (correct) comboStreak + 1 else 0
         feedbackReason = reason
         showLessonCard = true
@@ -480,18 +714,36 @@ class StudyViewModel(
         }
         recentTypes.add(scheduled.question.type)
 
+        if (isPastUnitReviewMode && scheduled.card.unitId == focusUnitId) {
+            if (reviewRoundCoveredIds.add(scheduled.card.id)) {
+                reviewRoundCompletedCount = reviewRoundCoveredIds.size
+                if (correct) {
+                    reviewRoundCorrectCount++
+                }
+            }
+        }
+
         if (deferDbCommit) {
             pendingCommit = PendingStudyCommit(scheduled, correct, userInput)
         } else {
             pendingCommit = null
-            activeCommitJob = container.appScope.launch {
+            val targetUnitSnapshot = focusUnitId
+            val modeSnap = modeToken
+            val qSnap = questionToken
+            val deferred = container.appScope.async {
                 val generated = repo.recordStudyAnswer(scheduled, correct, userInput)
-                viewModelScope.launch {
-                    if (generated) reinforcementCreated = true
-                    val readiness = repo.getUnitReadiness(subjectId)
-                    activeUnit = readiness.unit
-                    unitReadiness = readiness.readiness
-                    allUnitsCompleted = readiness.allUnitsCompleted
+                val readiness = repo.getUnitReadiness(subjectId, targetUnitId = targetUnitSnapshot)
+                generated to readiness
+            }
+            activeCommitDeferred = deferred
+            viewModelScope.launch {
+                val (generated, readiness) = runCatching { deferred.await() }.getOrNull() ?: return@launch
+                if (activeCommitDeferred === deferred) activeCommitDeferred = null
+                if (qSnap == questionToken && generated) {
+                    reinforcementCreated = true
+                }
+                if (modeSnap == modeToken) {
+                    applyReadiness(readiness)
                 }
             }
         }
@@ -502,8 +754,11 @@ class StudyViewModel(
         if (isAiRechecking || !offerAiRecheck) return
         isAiRechecking = true
         val inputSnapshot = shortInput
+        val myQuestionToken = questionToken
+        val myModeToken = modeToken
 
-        viewModelScope.launch {
+        recheckJob?.cancel()
+        recheckJob = viewModelScope.launch {
             runCatching {
                 container.geminiClient.gradeShortAnswer(
                     subject = subjectName,
@@ -512,23 +767,32 @@ class StudyViewModel(
                     userAnswer = inputSnapshot
                 )
             }.onSuccess { aiGrade ->
+                if (myQuestionToken != questionToken || myModeToken != modeToken) return@onSuccess
+                val wasWrong = !isCorrect
                 isCorrect = aiGrade.isCorrect
                 feedbackReason = aiGrade.explanation
                 offerAiRecheck = false
                 if (aiGrade.isCorrect) {
-                    comboStreak++
+                    comboStreak = comboBeforeAnswer + 1
+                    if (wasWrong && isPastUnitReviewMode && scheduled.card.unitId == focusUnitId) {
+                        reviewRoundCorrectCount++
+                    }
                 }
                 // Now commit the FINAL authoritative AI grade to Room DB
                 pendingCommit = PendingStudyCommit(scheduled, aiGrade.isCorrect, inputSnapshot)
                 ensurePendingCommitted()
             }.onFailure { e ->
+                if (myQuestionToken != questionToken || myModeToken != modeToken) return@onFailure
                 feedbackReason = "AI 재채점 실패: ${e.message}"
             }
-            isAiRechecking = false
+            if (myQuestionToken == questionToken) {
+                isAiRechecking = false
+            }
         }
     }
 
     override fun onCleared() {
+        cancelInFlightRecheck()
         // Flush any deferred pending commit on appScope so leaving the screen never drops the attempt
         val pending = pendingCommit
         pendingCommit = null
@@ -543,13 +807,20 @@ class StudyViewModel(
 
 class ExamViewModel(
     private val container: AppContainer,
-    val subjectId: Long
+    val subjectId: Long,
+    initialUnitId: Long? = null
 ) : ViewModel() {
     private val repo = container.learningRepository
 
+    var targetUnitId by mutableStateOf(initialUnitId)
+        private set
     var activeUnit by mutableStateOf<CurriculumUnitEntity?>(null)
         private set
     var allUnitsCompleted by mutableStateOf(false)
+        private set
+    var isRetakeCompletedUnit by mutableStateOf(false)
+        private set
+    var lastExamWasRetake by mutableStateOf(false)
         private set
 
     var isLoading by mutableStateOf(false)
@@ -572,20 +843,41 @@ class ExamViewModel(
     var finishedResult by mutableStateOf<ExamSessionEntity?>(null)
         private set
 
+    private var unitInfoJob: Job? = null
+
     init {
         refreshUnitInfo()
     }
 
+    fun selectExamUnit(unitId: Long?) {
+        if (isLoading || activeExamType != null) return
+        targetUnitId = unitId
+        finishedResult = null
+        errorMsg = null
+        refreshUnitInfo()
+    }
+
     fun refreshUnitInfo() {
-        viewModelScope.launch {
-            val readiness = repo.getUnitReadiness(subjectId)
+        unitInfoJob?.cancel()
+        val requested = targetUnitId
+        unitInfoJob = viewModelScope.launch {
+            val readiness = repo.getUnitReadiness(subjectId, targetUnitId = requested)
             activeUnit = readiness.unit
             allUnitsCompleted = readiness.allUnitsCompleted
+            isRetakeCompletedUnit = readiness.unit?.status == UnitStatus.COMPLETED
+            if (requested != null && readiness.unit?.id != requested) {
+                targetUnitId = null
+            }
         }
     }
 
     fun startCheckpointExam() {
+        if (isLoading) return
         val unit = activeUnit ?: return
+        if (unit.status == UnitStatus.LOCKED) {
+            errorMsg = "잠긴 단원은 시험에 응시할 수 없습니다."
+            return
+        }
         isLoading = true
         errorMsg = null
         finishedResult = null
@@ -595,14 +887,18 @@ class ExamViewModel(
         shortInput = ""
         viewModelScope.launch {
             runCatching {
-                repo.ensureActiveUnitPrefetched(subjectId)
+                repo.ensureUnitPrefetched(subjectId, unit.id)
                 repo.buildUnitCheckpointQuestions(subjectId, unit.id)
             }.onSuccess { qs ->
                 if (qs.isEmpty()) {
                     errorMsg = "출제할 단원 문제가 아직 없습니다."
                 } else {
                     activeExamType = ExamType.UNIT_CHECKPOINT
-                    activeExamTitle = "${unit.orderIndex}단원 체크포인트 시험"
+                    activeExamTitle = if (unit.status == UnitStatus.COMPLETED) {
+                        "${unit.orderIndex}단원 복습 시험"
+                    } else {
+                        "${unit.orderIndex}단원 체크포인트 시험"
+                    }
                     questions = qs
                 }
                 isLoading = false
@@ -614,6 +910,7 @@ class ExamViewModel(
     }
 
     fun startMockExam() {
+        if (isLoading) return
         isLoading = true
         errorMsg = null
         finishedResult = null
@@ -641,6 +938,7 @@ class ExamViewModel(
     }
 
     fun submitExamAnswer(q: LevelTestQuestionDto, userAns: String) {
+        if (isLoading || activeExamType == null || questions.isEmpty()) return
         val ok = if (q.type == QuestionType.SHORT_ANSWER) {
             AnswerGrader.gradeShortAnswer(userAns, q.answerText, q.acceptedAnswers).isCorrect
         } else {
@@ -653,7 +951,9 @@ class ExamViewModel(
             currentIndex++
         } else {
             val type = activeExamType ?: ExamType.MOCK_EXAM
-            val unitId = if (type == ExamType.UNIT_CHECKPOINT) activeUnit?.id else null
+            val examUnit = activeUnit
+            val unitId = if (type == ExamType.UNIT_CHECKPOINT) examUnit?.id else null
+            val wasRetake = type == ExamType.UNIT_CHECKPOINT && examUnit?.status == UnitStatus.COMPLETED
             val totalQs = questions.size
             val finalCorrect = correctCount
             val wrongCopy = wrongPrompts.toList()
@@ -669,16 +969,22 @@ class ExamViewModel(
                         correctCount = finalCorrect,
                         wrongPrompts = wrongCopy
                     )
-                    val readiness = repo.getUnitReadiness(subjectId)
-                    result to readiness
+                    // If an active unit passed, advance to the newly unlocked active unit (targetUnitId = null).
+                    // If retaking a past completed unit, stay on that unit.
+                    val nextTargetId = if (wasRetake) unitId else null
+                    val readiness = repo.getUnitReadiness(subjectId, targetUnitId = nextTargetId)
+                    Triple(result, readiness, nextTargetId)
                 }
                 viewModelScope.launch {
-                    outcome.onSuccess { (result, readiness) ->
+                    outcome.onSuccess { (result, readiness, nextTargetId) ->
                         finishedResult = result
+                        lastExamWasRetake = wasRetake
                         activeExamType = null
                         questions = emptyList()
+                        targetUnitId = nextTargetId
                         activeUnit = readiness.unit
                         allUnitsCompleted = readiness.allUnitsCompleted
+                        isRetakeCompletedUnit = readiness.unit?.status == UnitStatus.COMPLETED
                     }.onFailure { e ->
                         errorMsg = e.message ?: "시험 결과 저장 중 오류가 발생했습니다."
                         activeExamType = null

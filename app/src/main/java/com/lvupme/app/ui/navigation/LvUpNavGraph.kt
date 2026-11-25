@@ -51,8 +51,8 @@ object Routes {
     const val SETTINGS = "settings"
     const val ONBOARDING_CHAT = "onboarding_chat"
     const val LEVEL_TEST = "level_test/{proposalJson}"
-    const val STUDY = "study/{subjectId}?cardId={cardId}"
-    const val EXAM = "exam/{subjectId}"
+    const val STUDY = "study/{subjectId}?cardId={cardId}&unitId={unitId}"
+    const val EXAM = "exam/{subjectId}?unitId={unitId}"
 
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -73,8 +73,11 @@ object Routes {
         }.getOrNull()
     }
 
-    fun study(subjectId: Long, cardId: Long = -1L) = "study/$subjectId?cardId=$cardId"
-    fun exam(subjectId: Long) = "exam/$subjectId"
+    fun study(subjectId: Long, cardId: Long = -1L, unitId: Long = -1L) =
+        "study/$subjectId?cardId=$cardId&unitId=$unitId"
+
+    fun exam(subjectId: Long, unitId: Long = -1L) =
+        "exam/$subjectId?unitId=$unitId"
 }
 
 @Composable
@@ -174,8 +177,12 @@ fun LvUpNavGraph(
                 HomeScreen(
                     container = container,
                     onAddSubject = { navController.navigate(Routes.ONBOARDING_CHAT) },
-                    onOpenStudy = { id -> navController.navigate(Routes.study(id)) },
-                    onOpenExam = { id -> navController.navigate(Routes.exam(id)) },
+                    onOpenStudy = { id, unitId ->
+                        navController.navigate(Routes.study(id, unitId = unitId ?: -1L))
+                    },
+                    onOpenExam = { id, unitId ->
+                        navController.navigate(Routes.exam(id, unitId = unitId ?: -1L))
+                    },
                     onOpenSettings = { navController.navigate(Routes.SETTINGS) }
                 )
             }
@@ -223,30 +230,40 @@ fun LvUpNavGraph(
                 route = Routes.STUDY,
                 arguments = listOf(
                     navArgument("subjectId") { type = NavType.LongType },
-                    navArgument("cardId") { type = NavType.LongType; defaultValue = -1L }
+                    navArgument("cardId") { type = NavType.LongType; defaultValue = -1L },
+                    navArgument("unitId") { type = NavType.LongType; defaultValue = -1L }
                 )
             ) { entry ->
                 val subjectId = entry.arguments?.getLong("subjectId") ?: return@composable
                 val cardId = entry.arguments?.getLong("cardId")?.takeIf { it > 0L }
+                val unitId = entry.arguments?.getLong("unitId")?.takeIf { it > 0L }
                 StudyScreen(
                     container = container,
                     subjectId = subjectId,
                     initialPinnedCardId = cardId,
+                    initialFocusUnitId = unitId,
                     onBack = { navController.popBackStack() },
-                    onOpenExam = { id -> navController.navigate(Routes.exam(id)) }
+                    onOpenExam = { id, targetUnitId ->
+                        navController.navigate(Routes.exam(id, unitId = targetUnitId ?: -1L))
+                    }
                 )
             }
             composable(
                 route = Routes.EXAM,
-                arguments = listOf(navArgument("subjectId") { type = NavType.LongType })
+                arguments = listOf(
+                    navArgument("subjectId") { type = NavType.LongType },
+                    navArgument("unitId") { type = NavType.LongType; defaultValue = -1L }
+                )
             ) { entry ->
                 val subjectId = entry.arguments?.getLong("subjectId") ?: return@composable
+                val unitId = entry.arguments?.getLong("unitId")?.takeIf { it > 0L }
                 ExamScreen(
                     container = container,
                     subjectId = subjectId,
+                    initialUnitId = unitId,
                     onBack = { navController.popBackStack() },
-                    onGoStudy = { id ->
-                        navController.navigate(Routes.study(id)) {
+                    onGoStudy = { id, targetUnitId ->
+                        navController.navigate(Routes.study(id, unitId = targetUnitId ?: -1L)) {
                             popUpTo(Routes.HOME) { inclusive = false }
                         }
                     }

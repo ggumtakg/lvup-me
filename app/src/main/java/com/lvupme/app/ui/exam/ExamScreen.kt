@@ -22,6 +22,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.EmojiEvents
 import androidx.compose.material.icons.filled.Flag
+import androidx.compose.material.icons.filled.FormatListNumbered
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -35,6 +36,9 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -48,6 +52,7 @@ import com.lvupme.app.data.local.AppSettings
 import com.lvupme.app.data.local.ExamType
 import com.lvupme.app.data.local.QuestionType
 import com.lvupme.app.domain.AnswerGrader
+import com.lvupme.app.ui.components.CurriculumUnitsBottomSheet
 import com.lvupme.app.ui.theme.ChoiceTileCard
 import com.lvupme.app.ui.theme.ChoiceVisualState
 import com.lvupme.app.ui.theme.ChunkyProgressBar
@@ -64,18 +69,23 @@ import com.lvupme.app.ui.viewmodel.lvUpViewModelFactory
 fun ExamScreen(
     container: AppContainer,
     subjectId: Long,
+    initialUnitId: Long? = null,
     onBack: () -> Unit,
-    onGoStudy: (Long) -> Unit
+    onGoStudy: (subjectId: Long, unitId: Long?) -> Unit
 ) {
     val vm: ExamViewModel = viewModel(
-        key = "exam_$subjectId",
-        factory = lvUpViewModelFactory { ExamViewModel(container, subjectId) }
+        key = "exam_${subjectId}_${initialUnitId ?: 0L}",
+        factory = lvUpViewModelFactory { ExamViewModel(container, subjectId, initialUnitId) }
     )
     val g = MaterialTheme.game
 
     val subject by container.learningRepository.observeSubject(subjectId).collectAsState(initial = null)
+    val unitProgressList by remember(subjectId) {
+        container.learningRepository.observeUnitProgressList(subjectId)
+    }.collectAsState(initial = null)
     val pastExams by container.learningRepository.observeExams(subjectId).collectAsState(initial = emptyList())
     val settings by container.settingsRepository.settingsFlow.collectAsState(initial = AppSettings())
+    var showUnitsSheet by remember { mutableStateOf(false) }
 
     Scaffold(
         contentWindowInsets = WindowInsets(0),
@@ -241,11 +251,16 @@ fun ExamScreen(
                                 }
                                 Spacer(Modifier.height(14.dp))
                                 TactileButton(
-                                    onClick = { onGoStudy(subjectId) },
+                                    onClick = {
+                                        val targetUnitForStudy = if (vm.lastExamWasRetake) vm.activeUnit?.id else null
+                                        onGoStudy(subjectId, targetUnitForStudy)
+                                    },
                                     style = if (res.passed) TactileStyle.EMERALD else TactileStyle.SKY,
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
                                     val label = when {
+                                        vm.lastExamWasRetake && res.passed -> "이 단원 다시 복습하기 →"
+                                        vm.lastExamWasRetake -> "이 단원 취약 개념 복습하기 →"
                                         res.passed && vm.allUnitsCompleted -> "전체 커리큘럼 완료! 복습 계속하기 →"
                                         res.passed -> "다음 단원 학습하기 →"
                                         else -> "취약 개념 복습하러 가기 →"
@@ -258,35 +273,56 @@ fun ExamScreen(
 
                     GamifiedCard(
                         modifier = Modifier.fillMaxWidth(),
-                        borderColor = g.emerald.copy(alpha = 0.65f),
-                        lipColor = g.emeraldLip.copy(alpha = 0.65f)
+                        borderColor = if (vm.isRetakeCompletedUnit) g.violet.copy(alpha = 0.65f) else g.emerald.copy(alpha = 0.65f),
+                        lipColor = if (vm.isRetakeCompletedUnit) g.violetLip.copy(alpha = 0.65f) else g.emeraldLip.copy(alpha = 0.65f)
                     ) {
                         Column(Modifier.padding(18.dp)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
                                 Box(
                                     modifier = Modifier
                                         .size(40.dp)
                                         .clip(RoundedCornerShape(12.dp))
-                                        .background(g.emeraldSoft),
+                                        .background(if (vm.isRetakeCompletedUnit) g.violetSoft else g.emeraldSoft),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    Icon(Icons.Default.Flag, contentDescription = null, tint = g.emerald)
+                                    Icon(
+                                        Icons.Default.Flag,
+                                        contentDescription = null,
+                                        tint = if (vm.isRetakeCompletedUnit) g.violet else g.emerald
+                                    )
                                 }
                                 Spacer(Modifier.width(12.dp))
-                                Column {
-                                    Text("단원 체크포인트 시험", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold)
+                                Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        if (vm.allUnitsCompleted) "모든 단원을 완료했습니다 🎉"
-                                        else "합격 기준 ${settings.checkpointPassPercent}% 통과 시 다음 단원 해금",
+                                        if (vm.isRetakeCompletedUnit) "과거 단원 복습 시험" else "단원 체크포인트 시험",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.ExtraBold
+                                    )
+                                    Text(
+                                        when {
+                                            vm.allUnitsCompleted -> "모든 단원 완료 🎉 원하는 단원 재응시 가능"
+                                            vm.isRetakeCompletedUnit -> "완료된 단원 재응시 (기존 진도 유지)"
+                                            else -> "합격 기준 ${settings.checkpointPassPercent}% 통과 시 다음 단원 해금"
+                                        },
                                         style = MaterialTheme.typography.labelSmall,
-                                        color = g.emerald,
+                                        color = if (vm.isRetakeCompletedUnit) g.violet else g.emerald,
                                         fontWeight = FontWeight.Bold
                                     )
                                 }
+                                GamePillBadge(
+                                    text = "단원 변경",
+                                    containerColor = g.skySoft,
+                                    contentColor = g.sky,
+                                    icon = Icons.Default.FormatListNumbered,
+                                    onClick = { showUnitsSheet = true }
+                                )
                             }
                             Spacer(Modifier.height(10.dp))
                             Text(
-                                "대상 단원: ${vm.activeUnit?.title ?: "없음"}",
+                                text = vm.activeUnit?.let { "대상 단원: ${it.orderIndex}단원 · ${it.title}" } ?: "대상 단원: 없음",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -294,11 +330,14 @@ fun ExamScreen(
                             TactileButton(
                                 onClick = { vm.startCheckpointExam() },
                                 enabled = vm.activeUnit != null,
-                                style = TactileStyle.EMERALD,
+                                style = if (vm.isRetakeCompletedUnit) TactileStyle.VIOLET else TactileStyle.EMERALD,
                                 height = 46.dp,
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Text("단원 시험 응시하기", fontWeight = FontWeight.ExtraBold)
+                                Text(
+                                    if (vm.isRetakeCompletedUnit) "선택 단원 시험 재응시" else "단원 시험 응시하기",
+                                    fontWeight = FontWeight.ExtraBold
+                                )
                             }
                         }
                     }
@@ -384,5 +423,24 @@ fun ExamScreen(
                 }
             }
         }
+    }
+
+    if (showUnitsSheet) {
+        CurriculumUnitsBottomSheet(
+            subjectName = subject?.name ?: "시험",
+            units = unitProgressList,
+            currentFocusUnitId = vm.activeUnit?.id,
+            focusedBadgeLabel = "선택됨",
+            onDismiss = { showUnitsSheet = false },
+            onStudyUnit = { unitId, isPastCompleted ->
+                onGoStudy(subjectId, if (isPastCompleted) unitId else null)
+            },
+            onExamUnit = { unitId ->
+                vm.selectExamUnit(unitId)
+            },
+            onReturnToActiveProgress = if (vm.isRetakeCompletedUnit && !vm.allUnitsCompleted) {
+                { vm.selectExamUnit(null) }
+            } else null
+        )
     }
 }

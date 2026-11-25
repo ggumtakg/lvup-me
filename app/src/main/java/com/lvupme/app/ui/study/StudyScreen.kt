@@ -22,6 +22,8 @@ import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.EmojiEvents
+import androidx.compose.material.icons.filled.FormatListNumbered
 import androidx.compose.material.icons.filled.Quiz
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Replay
@@ -40,11 +42,15 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -53,6 +59,7 @@ import com.lvupme.app.AppContainer
 import com.lvupme.app.data.local.AppSettings
 import com.lvupme.app.data.local.QuestionType
 import com.lvupme.app.domain.AnswerGrader
+import com.lvupme.app.ui.components.CurriculumUnitsBottomSheet
 import com.lvupme.app.ui.theme.ChoiceTileCard
 import com.lvupme.app.ui.theme.ChoiceVisualState
 import com.lvupme.app.ui.theme.ChunkyProgressBar
@@ -70,20 +77,53 @@ fun StudyScreen(
     container: AppContainer,
     subjectId: Long,
     initialPinnedCardId: Long? = null,
+    initialFocusUnitId: Long? = null,
     onBack: () -> Unit,
-    onOpenExam: (Long) -> Unit
+    onOpenExam: (subjectId: Long, unitId: Long?) -> Unit
 ) {
     val vm: StudyViewModel = viewModel(
         key = "study_$subjectId",
-        factory = lvUpViewModelFactory { StudyViewModel(container, subjectId, initialPinnedCardId) }
+        factory = lvUpViewModelFactory {
+            StudyViewModel(container, subjectId, initialPinnedCardId, initialFocusUnitId)
+        }
     )
     val g = MaterialTheme.game
 
     val subject by container.learningRepository.observeSubject(subjectId).collectAsState(initial = null)
+    val unitProgressList by remember(subjectId) {
+        container.learningRepository.observeUnitProgressList(subjectId)
+    }.collectAsState(initial = null)
     val settings by container.settingsRepository.settingsFlow.collectAsState(initial = AppSettings())
+
+    var showUnitsSheet by remember { mutableStateOf(false) }
+
+    val openExamSafely: (Long?) -> Unit = { targetUnitId ->
+        vm.flushPendingCommit()
+        onOpenExam(subjectId, targetUnitId)
+    }
 
     LaunchedEffect(initialPinnedCardId) {
         vm.applyPinnedCard(initialPinnedCardId)
+    }
+
+    LaunchedEffect(initialFocusUnitId) {
+        if (initialPinnedCardId == null) {
+            vm.applyFocusUnitArg(initialFocusUnitId)
+        }
+    }
+
+    val reviewRoundTotal = vm.effectiveReviewRoundTotal
+    val headerProgress = when {
+        vm.isPastUnitReviewMode && reviewRoundTotal > 0 -> {
+            (vm.reviewRoundCompletedCount.toFloat() / reviewRoundTotal.toFloat()).coerceIn(0f, 1f)
+        }
+        else -> vm.unitReadiness
+    }
+    val headerProgressColor = if (vm.isPastUnitReviewMode) g.violet else g.emerald
+    val headerProgressLabel = when {
+        vm.isPastUnitReviewMode -> "${vm.reviewRoundCompletedCount}/$reviewRoundTotal"
+        vm.allUnitsCompleted -> "완료"
+        else -> "${(vm.unitReadiness * 100).toInt()}%"
     }
 
     Scaffold(
@@ -116,10 +156,10 @@ fun StudyScreen(
                                 modifier = Modifier.weight(1f, fill = false)
                             )
                             Text(
-                                text = if (vm.allUnitsCompleted) "완료" else "${(vm.unitReadiness * 100).toInt()}%",
+                                text = headerProgressLabel,
                                 style = MaterialTheme.typography.labelMedium,
                                 fontWeight = FontWeight.ExtraBold,
-                                color = g.emerald
+                                color = headerProgressColor
                             )
                             if (vm.comboStreak >= 2) {
                                 GamePillBadge(
@@ -130,17 +170,35 @@ fun StudyScreen(
                             }
                         }
                         ChunkyProgressBar(
-                            progress = vm.unitReadiness,
-                            fillColor = g.emerald,
+                            progress = headerProgress,
+                            fillColor = headerProgressColor,
                             height = 10.dp
                         )
                     }
                 },
                 actions = {
-                    IconButton(onClick = { onOpenExam(subjectId) }) {
+                    IconButton(
+                        onClick = { showUnitsSheet = true },
+                        enabled = !vm.isAiRechecking
+                    ) {
+                        Icon(
+                            Icons.Default.FormatListNumbered,
+                            contentDescription = "단원 목록",
+                            tint = g.violet
+                        )
+                    }
+                    IconButton(
+                        onClick = {
+                            openExamSafely(if (vm.isPastUnitReviewMode) vm.activeUnit?.id else null)
+                        },
+                        enabled = !vm.isAiRechecking
+                    ) {
                         Icon(Icons.Default.Quiz, contentDescription = "시험", tint = g.sky)
                     }
-                    IconButton(onClick = { vm.loadNextQuestion(prefetchIfMissing = true) }) {
+                    IconButton(
+                        onClick = { vm.loadNextQuestion(prefetchIfMissing = true) },
+                        enabled = !vm.isAiRechecking
+                    ) {
                         Icon(Icons.Default.Refresh, contentDescription = "새로고침")
                     }
                 }
@@ -156,31 +214,98 @@ fun StudyScreen(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            if (!vm.allUnitsCompleted && vm.unitReadiness >= 0.75f) {
-                GamifiedCard(
-                    containerColor = g.skySoft,
-                    borderColor = g.sky,
-                    lipColor = g.skyLip,
-                    onClick = { onOpenExam(subjectId) }
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 14.dp, vertical = 10.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+            // Contextual top banners
+            when {
+                vm.isPastUnitReviewMode && !vm.showPastReviewCompleteGate -> {
+                    GamifiedCard(
+                        containerColor = g.violetSoft,
+                        borderColor = g.violet,
+                        lipColor = g.violetLip,
+                        onClick = if (!vm.isAiRechecking) ({ showUnitsSheet = true }) else null
                     ) {
-                        Text(
-                            "🎯 단원 체크포인트 시험 준비 완료!",
-                            fontWeight = FontWeight.ExtraBold,
-                            color = g.sky
-                        )
-                        Text(
-                            "응시하기 →",
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.ExtraBold,
-                            color = g.sky
-                        )
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                "🔁 ${vm.activeUnit?.orderIndex ?: ""}단원 과거 복습 중 (진도 유지)",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = g.violet,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                "단원 변경 →",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = g.violet
+                            )
+                        }
+                    }
+                }
+
+                !vm.isPastUnitReviewMode && vm.allUnitsCompleted -> {
+                    GamifiedCard(
+                        containerColor = g.emeraldSoft,
+                        borderColor = g.emerald,
+                        lipColor = g.emeraldLip,
+                        onClick = if (!vm.isAiRechecking) ({ showUnitsSheet = true }) else null
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                "🎉 모든 단원 완료! 전 단원 균형 복습 중",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = g.emerald,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                "단원 선택 →",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = g.emerald
+                            )
+                        }
+                    }
+                }
+
+                !vm.isPastUnitReviewMode && !vm.allUnitsCompleted && !vm.showUnitCompleteGate && vm.unitReadiness >= 0.75f -> {
+                    val isFull = vm.unitReadiness >= 1f
+                    GamifiedCard(
+                        containerColor = if (isFull) g.goldSoft else g.skySoft,
+                        borderColor = if (isFull) g.gold else g.sky,
+                        lipColor = if (isFull) g.goldLip else g.skyLip,
+                        onClick = if (!vm.isAiRechecking) ({ openExamSafely(vm.activeUnit?.id) }) else null
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                if (isFull) "🏆 단원 100% 완료 · 추가 복습 중" else "🎯 단원 체크포인트 시험 준비 완료!",
+                                fontWeight = FontWeight.ExtraBold,
+                                color = if (isFull) g.gold else g.sky,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                "응시하기 →",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = if (isFull) g.gold else g.sky
+                            )
+                        }
                     }
                 }
             }
@@ -196,6 +321,191 @@ fun StudyScreen(
                         CircularProgressIndicator(color = g.emerald)
                         Spacer(Modifier.height(14.dp))
                         Text("학습 카드를 준비하고 있어요...", fontWeight = FontWeight.SemiBold)
+                    }
+                }
+
+                vm.showUnitCompleteGate -> {
+                    val unit = vm.activeUnit
+                    GamifiedCard(
+                        modifier = Modifier.fillMaxWidth(),
+                        containerColor = g.cardBg,
+                        borderColor = g.emerald,
+                        lipColor = g.emeraldLip
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(24.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(64.dp)
+                                    .clip(RoundedCornerShape(18.dp))
+                                    .background(g.emeraldSoft),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    Icons.Default.EmojiEvents,
+                                    contentDescription = null,
+                                    tint = g.emerald,
+                                    modifier = Modifier.size(36.dp)
+                                )
+                            }
+                            Spacer(Modifier.height(14.dp))
+                            GamePillBadge(
+                                text = "진행도 100% 달성 (${vm.unitPracticedCount}/${vm.unitTotalCards} 카드)",
+                                containerColor = g.emeraldSoft,
+                                contentColor = g.emerald
+                            )
+                            Spacer(Modifier.height(10.dp))
+                            Text(
+                                text = "${unit?.orderIndex ?: ""}단원 학습 완료! 🎉",
+                                style = MaterialTheme.typography.headlineSmall,
+                                fontWeight = FontWeight.ExtraBold,
+                                textAlign = TextAlign.Center
+                            )
+                            if (unit != null) {
+                                Spacer(Modifier.height(4.dp))
+                                Text(
+                                    text = unit.title,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = g.sky,
+                                    fontWeight = FontWeight.Bold,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
+                            Spacer(Modifier.height(10.dp))
+                            Text(
+                                text = "이 단원의 모든 핵심 카드를 익혔어요.\n체크포인트 시험을 통과하면 다음 단원이 해금됩니다!",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center
+                            )
+                            Spacer(Modifier.height(20.dp))
+                            TactileButton(
+                                onClick = { openExamSafely(unit?.id) },
+                                style = TactileStyle.EMERALD,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("🎯 체크포인트 시험 보러 가기", fontWeight = FontWeight.ExtraBold, fontSize = 16.sp)
+                            }
+                            Spacer(Modifier.height(10.dp))
+                            TactileButton(
+                                onClick = { vm.continueExtraPracticeAfterUnitComplete() },
+                                style = TactileStyle.SKY,
+                                height = 46.dp,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("이 단원 추가 복습 계속하기", fontWeight = FontWeight.ExtraBold)
+                            }
+                            Spacer(Modifier.height(10.dp))
+                            TactileButton(
+                                onClick = { showUnitsSheet = true },
+                                style = TactileStyle.VIOLET,
+                                height = 46.dp,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("다른 단원 선택하기", fontWeight = FontWeight.ExtraBold)
+                            }
+                        }
+                    }
+                }
+
+                vm.showPastReviewCompleteGate -> {
+                    val unit = vm.activeUnit
+                    GamifiedCard(
+                        modifier = Modifier.fillMaxWidth(),
+                        containerColor = g.cardBg,
+                        borderColor = g.violet,
+                        lipColor = g.violetLip
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(24.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(64.dp)
+                                    .clip(RoundedCornerShape(18.dp))
+                                    .background(g.violetSoft),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    Icons.Default.Replay,
+                                    contentDescription = null,
+                                    tint = g.violet,
+                                    modifier = Modifier.size(34.dp)
+                                )
+                            }
+                            Spacer(Modifier.height(14.dp))
+                            GamePillBadge(
+                                text = "정답 ${vm.reviewRoundCorrectCount} / $reviewRoundTotal",
+                                containerColor = g.violetSoft,
+                                contentColor = g.violet
+                            )
+                            Spacer(Modifier.height(10.dp))
+                            Text(
+                                text = "${unit?.orderIndex ?: ""}단원 집중 복습 완료! 🎉",
+                                style = MaterialTheme.typography.headlineSmall,
+                                fontWeight = FontWeight.ExtraBold,
+                                textAlign = TextAlign.Center
+                            )
+                            if (unit != null) {
+                                Spacer(Modifier.height(4.dp))
+                                Text(
+                                    text = unit.title,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = g.violet,
+                                    fontWeight = FontWeight.Bold,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
+                            Spacer(Modifier.height(10.dp))
+                            Text(
+                                text = "선택한 과거 단원의 카드 ${reviewRoundTotal}개를 한 바퀴 모두 복습했어요.\n기존 커리큘럼 진도는 그대로 유지됩니다.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center
+                            )
+                            Spacer(Modifier.height(20.dp))
+                            TactileButton(
+                                onClick = { vm.restartPastReviewRound() },
+                                style = TactileStyle.VIOLET,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("한 번 더 복습하기", fontWeight = FontWeight.ExtraBold, fontSize = 16.sp)
+                            }
+                            Spacer(Modifier.height(10.dp))
+                            TactileButton(
+                                onClick = { openExamSafely(unit?.id) },
+                                style = TactileStyle.SKY,
+                                height = 46.dp,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("이 단원 시험 재응시하기", fontWeight = FontWeight.ExtraBold)
+                            }
+                            Spacer(Modifier.height(10.dp))
+                            TactileButton(
+                                onClick = {
+                                    if (vm.allUnitsCompleted) {
+                                        showUnitsSheet = true
+                                    } else {
+                                        vm.switchToUnit(null)
+                                    }
+                                },
+                                style = TactileStyle.EMERALD,
+                                height = 46.dp,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(
+                                    if (vm.allUnitsCompleted) "다른 단원 선택하기" else "현재 진도로 돌아가기",
+                                    fontWeight = FontWeight.ExtraBold
+                                )
+                            }
+                        }
                     }
                 }
 
@@ -235,20 +545,39 @@ fun StudyScreen(
                             horizontalArrangement = Arrangement.spacedBy(6.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            if (scheduled.isFromPastReview) {
-                                GamePillBadge(
-                                    text = "과거 복습 ${settings.newToReviewRatio}:1",
-                                    containerColor = g.goldSoft,
-                                    contentColor = g.gold,
-                                    icon = Icons.Default.Replay
-                                )
-                            } else {
-                                GamePillBadge(
-                                    text = "현재 진도",
-                                    containerColor = g.skySoft,
-                                    contentColor = g.sky,
-                                    icon = Icons.Default.Bolt
-                                )
+                            when {
+                                vm.isPastUnitReviewMode -> {
+                                    GamePillBadge(
+                                        text = "${vm.activeUnit?.orderIndex ?: ""}단원 집중 복습",
+                                        containerColor = g.violetSoft,
+                                        contentColor = g.violet,
+                                        icon = Icons.Default.Replay
+                                    )
+                                }
+                                vm.allUnitsCompleted -> {
+                                    GamePillBadge(
+                                        text = "전 단원 균형 복습",
+                                        containerColor = g.emeraldSoft,
+                                        contentColor = g.emerald,
+                                        icon = Icons.Default.AutoAwesome
+                                    )
+                                }
+                                scheduled.isFromPastReview -> {
+                                    GamePillBadge(
+                                        text = "과거 복습 ${settings.newToReviewRatio}:1",
+                                        containerColor = g.goldSoft,
+                                        contentColor = g.gold,
+                                        icon = Icons.Default.Replay
+                                    )
+                                }
+                                else -> {
+                                    GamePillBadge(
+                                        text = "현재 진도",
+                                        containerColor = g.skySoft,
+                                        contentColor = g.sky,
+                                        icon = Icons.Default.Bolt
+                                    )
+                                }
                             }
                             GamePillBadge(
                                 text = if (q.type == QuestionType.SHORT_ANSWER) "주관식 ≤${maxWords}단어" else "객관식",
@@ -297,7 +626,11 @@ fun StudyScreen(
                     GamifiedCard(modifier = Modifier.fillMaxWidth()) {
                         Column(Modifier.padding(20.dp)) {
                             Text(
-                                text = if (vm.allUnitsCompleted) "전체 커리큘럼 복습 모드 🎉" else (vm.activeUnit?.title ?: ""),
+                                text = when {
+                                    vm.isPastUnitReviewMode -> "${vm.activeUnit?.orderIndex ?: ""}단원 · ${vm.activeUnit?.title ?: ""}"
+                                    vm.allUnitsCompleted -> "${card.unitOrderIndex}단원 복습 · 전체 커리큘럼 완료 🎉"
+                                    else -> "${vm.activeUnit?.orderIndex ?: ""}단원 · ${vm.activeUnit?.title ?: ""}"
+                                },
                                 style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 fontWeight = FontWeight.Bold
@@ -480,13 +813,25 @@ fun StudyScreen(
                             }
                         }
 
+                        val nextBtnLabel = when {
+                            vm.isReadyToFinishPastReviewRound -> "${vm.activeUnit?.orderIndex ?: ""}단원 복습 완료! 결과 보기 →"
+                            vm.isReadyToFinishActiveUnit -> "단원 100% 달성! 다음 단계 보기 →"
+                            else -> "계속하기 →"
+                        }
+                        val nextBtnStyle = when {
+                            vm.isReadyToFinishPastReviewRound -> TactileStyle.VIOLET
+                            vm.isReadyToFinishActiveUnit -> TactileStyle.GOLD
+                            vm.isCorrect -> TactileStyle.EMERALD
+                            else -> TactileStyle.SKY
+                        }
+
                         TactileButton(
                             onClick = { vm.loadNextQuestion(prefetchIfMissing = false) },
                             enabled = !vm.isAiRechecking,
-                            style = if (vm.isCorrect) TactileStyle.EMERALD else TactileStyle.SKY,
+                            style = nextBtnStyle,
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            Text("계속하기 →", fontWeight = FontWeight.ExtraBold, fontSize = 16.sp)
+                            Text(nextBtnLabel, fontWeight = FontWeight.ExtraBold, fontSize = 16.sp)
                         }
                     }
 
@@ -510,5 +855,23 @@ fun StudyScreen(
                 }
             }
         }
+    }
+
+    if (showUnitsSheet) {
+        CurriculumUnitsBottomSheet(
+            subjectName = subject?.name ?: "학습",
+            units = unitProgressList,
+            currentFocusUnitId = if (vm.isPastUnitReviewMode) vm.focusUnitId else null,
+            onDismiss = { showUnitsSheet = false },
+            onStudyUnit = { unitId, isPastCompleted ->
+                vm.switchToUnit(if (isPastCompleted) unitId else null)
+            },
+            onExamUnit = { unitId ->
+                openExamSafely(unitId)
+            },
+            onReturnToActiveProgress = if (vm.isPastUnitReviewMode) {
+                { vm.switchToUnit(null) }
+            } else null
+        )
     }
 }

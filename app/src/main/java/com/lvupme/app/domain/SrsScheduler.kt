@@ -37,7 +37,10 @@ class SrsScheduler {
         recentCardIds: List<Long>,
         recentQuestionTypes: List<String>,
         recentPastCardIds: List<Long> = emptyList(),
-        nowMillis: Long = System.currentTimeMillis()
+        nowMillis: Long = System.currentTimeMillis(),
+        focusUnitOnly: Boolean = false,
+        reviewAllUnits: Boolean = false,
+        sessionCoveredCardIds: Set<Long> = emptySet()
     ): ScheduledQuestion? {
         if (cards.isEmpty() || questions.isEmpty()) return null
 
@@ -48,38 +51,64 @@ class SrsScheduler {
         val currentUnitCards = usableCards.filter { it.unitId == activeUnitId }
         val pastUnitCards = usableCards.filter { it.unitOrderIndex < activeUnitOrder }
 
-        val cycleLength = settings.newToReviewRatio + 1 // default 5 + 1 = 6
-        val wantsPastReview = pastUnitCards.isNotEmpty() && ((sessionIndex + 1) % cycleLength == 0)
-
         val chosenCard: LearningCardEntity
         val isFromPast: Boolean
 
-        if (wantsPastReview) {
-            chosenCard = pickWeightedPastCard(
-                pastCards = pastUnitCards,
-                states = states,
-                activeUnitOrder = activeUnitOrder,
-                recentPastCardIds = recentPastCardIds,
-                nowMillis = nowMillis
-            )
-            isFromPast = true
-        } else if (currentUnitCards.isNotEmpty()) {
-            chosenCard = pickCurrentUnitCard(
-                currentCards = currentUnitCards,
-                states = states,
-                recentCardIds = recentCardIds,
-                nowMillis = nowMillis
-            )
-            isFromPast = false
-        } else {
-            chosenCard = pickWeightedPastCard(
-                pastCards = usableCards,
-                states = states,
-                activeUnitOrder = activeUnitOrder,
-                recentPastCardIds = recentPastCardIds.ifEmpty { recentCardIds },
-                nowMillis = nowMillis
-            )
-            isFromPast = true
+        when {
+            focusUnitOnly -> {
+                if (currentUnitCards.isEmpty()) return null
+                chosenCard = pickFocusedUnitCard(
+                    unitCards = currentUnitCards,
+                    states = states,
+                    recentCardIds = recentCardIds,
+                    sessionCoveredCardIds = sessionCoveredCardIds,
+                    nowMillis = nowMillis
+                )
+                isFromPast = false
+            }
+
+            reviewAllUnits -> {
+                chosenCard = pickAllUnitsBalancedCard(
+                    allCards = usableCards,
+                    states = states,
+                    recentCardIds = recentCardIds,
+                    nowMillis = nowMillis
+                )
+                isFromPast = true
+            }
+
+            else -> {
+                val cycleLength = settings.newToReviewRatio + 1 // default 5 + 1 = 6
+                val wantsPastReview = pastUnitCards.isNotEmpty() && ((sessionIndex + 1) % cycleLength == 0)
+
+                if (wantsPastReview) {
+                    chosenCard = pickWeightedPastCard(
+                        pastCards = pastUnitCards,
+                        states = states,
+                        activeUnitOrder = activeUnitOrder,
+                        recentPastCardIds = recentPastCardIds,
+                        nowMillis = nowMillis
+                    )
+                    isFromPast = true
+                } else if (currentUnitCards.isNotEmpty()) {
+                    chosenCard = pickCurrentUnitCard(
+                        currentCards = currentUnitCards,
+                        states = states,
+                        recentCardIds = recentCardIds,
+                        nowMillis = nowMillis
+                    )
+                    isFromPast = false
+                } else {
+                    chosenCard = pickWeightedPastCard(
+                        pastCards = usableCards,
+                        states = states,
+                        activeUnitOrder = activeUnitOrder,
+                        recentPastCardIds = recentPastCardIds.ifEmpty { recentCardIds },
+                        nowMillis = nowMillis
+                    )
+                    isFromPast = true
+                }
+            }
         }
 
         val state = states[chosenCard.id] ?: defaultReviewState(chosenCard)
@@ -147,6 +176,79 @@ class SrsScheduler {
             }.thenBy { card ->
                 // Older lastReviewedAt breaks ties so cards rotate cleanly
                 -(states[card.id]?.lastReviewedAt ?: 0L)
+            }
+        )
+    }
+
+    /**
+     * Focused single-unit review (e.g., revisiting a completed past unit):
+     * Strictly prioritizes cards not yet covered in the current review round so the user
+     * completes a full pass over the unit cleanly, prioritizing weak & error-prone cards first.
+     */
+    private fun pickFocusedUnitCard(
+        unitCards: List<LearningCardEntity>,
+        states: Map<Long, ReviewStateEntity>,
+        recentCardIds: List<Long>,
+        sessionCoveredCardIds: Set<Long>,
+        nowMillis: Long
+    ): LearningCardEntity {
+        val uncovered = unitCards.filterNot { it.id in sessionCoveredCardIds }
+        if (uncovered.isEmpty()) {
+            return pickCurrentUnitCard(unitCards, states, recentCardIds, nowMillis)
+        }
+        return uncovered.maxWith(
+            compareBy<LearningCardEntity> { card ->
+                val st = states[card.id] ?: defaultReviewState(card)
+                var score = 0.0
+                if (st.isWeak) score += 4.0
+                score += min(st.wrongCount, 6) * 0.75
+                if (st.nextReviewAt in 1..nowMillis) score += 2.0
+                score += (5 - min(st.masteryLevel, 5)) * 0.5
+                score
+            }.thenBy { card ->
+                -(states[card.id]?.lastReviewedAt ?: 0L)
+            }.thenBy { card ->
+                -card.id
+            }
+        )
+    }
+
+    /**
+     * Balanced review across the entire curriculum after all units are completed:
+     * Avoids biasing toward the last unit by weighting purely on weakness, error rate,
+     * SRS overdue status, and least-recently-reviewed order.
+     */
+    private fun pickAllUnitsBalancedCard(
+        allCards: List<LearningCardEntity>,
+        states: Map<Long, ReviewStateEntity>,
+        recentCardIds: List<Long>,
+        nowMillis: Long
+    ): LearningCardEntity {
+        val excludeCount = min(max(0, allCards.size - 1), 4)
+        val excluded = recentCardIds.takeLast(excludeCount).toSet()
+        val candidates = allCards.filterNot { it.id in excluded }.ifEmpty { allCards }
+
+        return candidates.maxWith(
+            compareBy<LearningCardEntity> { card ->
+                val st = states[card.id] ?: defaultReviewState(card)
+                val errorRate = if (st.totalAttempts == 0) 0.35
+                else (st.wrongCount.toDouble() + 0.5) / (st.totalAttempts.toDouble() + 1.0)
+                val errorWeight = 1.0 + (errorRate * 3.0) + (min(st.wrongCount, 6) * 0.45)
+
+                val dueWeight = when {
+                    st.nextReviewAt <= 0L -> 1.3
+                    nowMillis >= st.nextReviewAt -> {
+                        val overdueHours = (nowMillis - st.nextReviewAt) / 3_600_000.0
+                        1.5 + min(overdueHours / 24.0, 2.0)
+                    }
+                    else -> 0.55
+                }
+                val weakBonus = if (st.isWeak) 1.5 else 1.0
+                errorWeight * dueWeight * weakBonus
+            }.thenBy { card ->
+                -(states[card.id]?.lastReviewedAt ?: 0L)
+            }.thenBy { card ->
+                -card.id
             }
         )
     }

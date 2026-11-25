@@ -203,4 +203,128 @@ class SrsSchedulerTest {
         assertTrue(state.intervalHours <= 24.0 * 60.0)
         assertTrue(state.easeFactor <= 3.0)
     }
+
+    @Test
+    fun focusedPastUnitReviewCoversEveryCardOnceWithoutMixingOtherUnits() {
+        val now = 3_000_000_000L
+        val unit1Cards = (1L..4L).map { id ->
+            LearningCardEntity(id = id, subjectId = 1, unitId = 1, unitOrderIndex = 1, title = "U1-$id", microSummary = "", detailExplanation = "")
+        }
+        val unit2Cards = (11L..14L).map { id ->
+            LearningCardEntity(id = id, subjectId = 1, unitId = 2, unitOrderIndex = 2, title = "U2-$id", microSummary = "", detailExplanation = "")
+        }
+        val allCards = unit1Cards + unit2Cards
+        val allQuestions = allCards.map { c ->
+            QuizQuestionEntity(id = c.id * 10, subjectId = 1, unitId = c.unitId, cardId = c.id, type = QuestionType.MULTIPLE_CHOICE, prompt = "Q ${c.id}", answerText = "A")
+        }
+        val states = mapOf(
+            3L to ReviewStateEntity(cardId = 3, subjectId = 1, unitId = 1, unitOrderIndex = 1, totalAttempts = 4, wrongCount = 3, isWeak = true, lastReviewedAt = now - 10_000L)
+        )
+
+        val covered = mutableSetOf<Long>()
+        val pickedOrder = mutableListOf<Long>()
+        for (step in 0 until 4) {
+            val picked = scheduler.selectNextQuestion(
+                activeUnitId = 1,
+                activeUnitOrder = 1,
+                cards = allCards,
+                questions = allQuestions,
+                states = states,
+                settings = AppSettings(newToReviewRatio = 1, mcPercent = 70),
+                sessionIndex = step + 5, // would trigger 5:1 past mixing in normal mode
+                recentCardIds = pickedOrder,
+                recentQuestionTypes = emptyList(),
+                nowMillis = now,
+                focusUnitOnly = true,
+                sessionCoveredCardIds = covered
+            )
+            assertNotNull(picked)
+            assertEquals("Focused review must stay strictly inside target unit 1", 1L, picked!!.card.unitId)
+            assertFalse("Focused review should not repeat cards before completing the round", picked.card.id in covered)
+            covered.add(picked.card.id)
+            pickedOrder.add(picked.card.id)
+        }
+
+        assertEquals("Weak card #3 should be prioritized first in focused review", 3L, pickedOrder.first())
+        assertEquals(setOf(1L, 2L, 3L, 4L), covered)
+    }
+
+    @Test
+    fun allUnitsCompletedReviewBalancesAcrossAllUnitsWithoutLastUnitBias() {
+        val now = 4_000_000_000L
+        val cards = listOf(1L, 2L, 3L).flatMap { unitId ->
+            (1L..3L).map { idx ->
+                val id = unitId * 10 + idx
+                LearningCardEntity(id = id, subjectId = 1, unitId = unitId, unitOrderIndex = unitId.toInt(), title = "U$unitId-$idx", microSummary = "", detailExplanation = "")
+            }
+        }
+        val questions = cards.map { c ->
+            QuizQuestionEntity(id = c.id * 10, subjectId = 1, unitId = c.unitId, cardId = c.id, type = QuestionType.MULTIPLE_CHOICE, prompt = "Q ${c.id}", answerText = "A")
+        }
+        val states = cards.associate { c ->
+            c.id to ReviewStateEntity(
+                cardId = c.id,
+                subjectId = 1,
+                unitId = c.unitId,
+                unitOrderIndex = c.unitOrderIndex,
+                masteryLevel = 2,
+                totalAttempts = 2,
+                wrongCount = 0,
+                lastReviewedAt = now - 86_400_000L,
+                nextReviewAt = now - 1_000L
+            )
+        }
+
+        val recent = mutableListOf<Long>()
+        val unitCounts = mutableMapOf<Long, Int>()
+        val mutableStates = states.toMutableMap()
+        for (step in 0 until 9) {
+            val picked = scheduler.selectNextQuestion(
+                activeUnitId = 3,
+                activeUnitOrder = 3,
+                cards = cards,
+                questions = questions,
+                states = mutableStates,
+                settings = AppSettings(newToReviewRatio = 5, mcPercent = 70),
+                sessionIndex = step,
+                recentCardIds = recent,
+                recentQuestionTypes = emptyList(),
+                nowMillis = now + step * 5_000L,
+                reviewAllUnits = true
+            )!!
+            unitCounts[picked.card.unitId] = (unitCounts[picked.card.unitId] ?: 0) + 1
+            recent.add(picked.card.id)
+            mutableStates[picked.card.id] = scheduler.updateReviewState(
+                current = mutableStates[picked.card.id]!!,
+                isCorrect = true,
+                questionType = picked.question.type,
+                weakThreshold = 2,
+                nowMillis = now + step * 5_000L
+            )
+        }
+
+        assertEquals("Unit 1 should be reviewed evenly", 3, unitCounts[1L])
+        assertEquals("Unit 2 should be reviewed evenly", 3, unitCounts[2L])
+        assertEquals("Unit 3 should not dominate 5:1 after all units complete", 3, unitCounts[3L])
+    }
+
+    @Test
+    fun focusedUnitReviewReturnsNullWhenTargetUnitHasNoCards() {
+        val unit2Card = LearningCardEntity(id = 11, subjectId = 1, unitId = 2, unitOrderIndex = 2, title = "U2", microSummary = "", detailExplanation = "")
+        val q = QuizQuestionEntity(id = 110, subjectId = 1, unitId = 2, cardId = 11, type = QuestionType.MULTIPLE_CHOICE, prompt = "Q", answerText = "A")
+
+        val picked = scheduler.selectNextQuestion(
+            activeUnitId = 1,
+            activeUnitOrder = 1,
+            cards = listOf(unit2Card),
+            questions = listOf(q),
+            states = emptyMap(),
+            settings = AppSettings(),
+            sessionIndex = 0,
+            recentCardIds = emptyList(),
+            recentQuestionTypes = emptyList(),
+            focusUnitOnly = true
+        )
+        assertEquals(null, picked)
+    }
 }

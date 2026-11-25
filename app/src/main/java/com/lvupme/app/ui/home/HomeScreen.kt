@@ -28,6 +28,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.EmojiEvents
+import androidx.compose.material.icons.filled.FormatListNumbered
 import androidx.compose.material.icons.filled.LocalFireDepartment
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
@@ -66,6 +67,7 @@ import com.lvupme.app.data.local.AppSettings
 import com.lvupme.app.data.local.SubjectEntity
 import com.lvupme.app.data.repository.SubjectDashboardItem
 import com.lvupme.app.notification.NotificationHelper
+import com.lvupme.app.ui.components.CurriculumUnitsBottomSheet
 import com.lvupme.app.ui.theme.ChunkyProgressBar
 import com.lvupme.app.ui.theme.GamePillBadge
 import com.lvupme.app.ui.theme.GamifiedCard
@@ -79,8 +81,8 @@ import kotlinx.coroutines.launch
 fun HomeScreen(
     container: AppContainer,
     onAddSubject: () -> Unit,
-    onOpenStudy: (Long) -> Unit,
-    onOpenExam: (Long) -> Unit,
+    onOpenStudy: (subjectId: Long, unitId: Long?) -> Unit,
+    onOpenExam: (subjectId: Long, unitId: Long?) -> Unit,
     onOpenSettings: () -> Unit
 ) {
     val repo = container.learningRepository
@@ -100,6 +102,7 @@ fun HomeScreen(
     ) { granted -> hasNotifPerm = granted }
 
     var deleteTarget by remember { mutableStateOf<SubjectEntity?>(null) }
+    var unitSheetSubject by remember { mutableStateOf<SubjectEntity?>(null) }
 
     Scaffold(
         contentWindowInsets = WindowInsets(0),
@@ -330,13 +333,32 @@ fun HomeScreen(
                                 )
                             }
                         },
-                        onStudy = { onOpenStudy(item.subject.id) },
-                        onExam = { onOpenExam(item.subject.id) },
+                        onStudy = { onOpenStudy(item.subject.id, null) },
+                        onExam = { onOpenExam(item.subject.id, null) },
+                        onOpenUnits = { unitSheetSubject = item.subject },
                         onDelete = { deleteTarget = item.subject }
                     )
                 }
             }
         }
+    }
+
+    unitSheetSubject?.let { targetSubject ->
+        val units by remember(targetSubject.id) {
+            repo.observeUnitProgressList(targetSubject.id)
+        }.collectAsState(initial = null)
+
+        CurriculumUnitsBottomSheet(
+            subjectName = targetSubject.name,
+            units = units,
+            onDismiss = { unitSheetSubject = null },
+            onStudyUnit = { unitId, isPastCompleted ->
+                onOpenStudy(targetSubject.id, if (isPastCompleted) unitId else null)
+            },
+            onExamUnit = { unitId ->
+                onOpenExam(targetSubject.id, unitId)
+            }
+        )
     }
 
     deleteTarget?.let { target ->
@@ -450,6 +472,7 @@ private fun SubjectGameCard(
     onToggleTts: () -> Unit,
     onStudy: () -> Unit,
     onExam: () -> Unit,
+    onOpenUnits: () -> Unit,
     onDelete: () -> Unit
 ) {
     val g = MaterialTheme.game
@@ -457,6 +480,10 @@ private fun SubjectGameCard(
     val unitProgress = if (item.totalUnits > 0) {
         item.completedUnits.toFloat() / item.totalUnits.toFloat()
     } else 0f
+    val activeUnitDone = item.totalUnits > 0 &&
+        item.completedUnits < item.totalUnits &&
+        item.activeUnitTotalCards > 0 &&
+        item.activeUnitReadiness >= 1f
 
     var menuExpanded by remember { mutableStateOf(false) }
 
@@ -537,6 +564,16 @@ private fun SubjectGameCard(
                         onDismissRequest = { menuExpanded = false }
                     ) {
                         DropdownMenuItem(
+                            text = { Text("단원 목록 · 과거 단원 복습") },
+                            leadingIcon = {
+                                Icon(Icons.Default.FormatListNumbered, contentDescription = null)
+                            },
+                            onClick = {
+                                menuExpanded = false
+                                onOpenUnits()
+                            }
+                        )
+                        DropdownMenuItem(
                             text = { Text(if (subject.ttsEnabled) "TTS 발음 끄기" else "TTS 발음 켜기") },
                             leadingIcon = {
                                 Icon(
@@ -574,7 +611,14 @@ private fun SubjectGameCard(
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.weight(1f)
                 )
-                if (item.weakCardsCount > 0) {
+                if (activeUnitDone) {
+                    Spacer(Modifier.width(6.dp))
+                    GamePillBadge(
+                        text = "시험 준비 100%",
+                        containerColor = g.skySoft,
+                        contentColor = g.sky
+                    )
+                } else if (item.weakCardsCount > 0) {
                     Spacer(Modifier.width(6.dp))
                     GamePillBadge(
                         text = "취약 ${item.weakCardsCount}",
@@ -589,22 +633,35 @@ private fun SubjectGameCard(
                 fillColor = accent,
                 height = 10.dp
             )
-            Spacer(Modifier.height(6.dp))
+            Spacer(Modifier.height(8.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
                     "단원 ${item.completedUnits}/${item.totalUnits} 완료 · 학습 카드 ${item.totalCards}개",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                if (subject.ttsEnabled) {
-                    Text(
-                        "🔊 TTS ON",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = g.emerald,
-                        fontWeight = FontWeight.Bold
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    if (subject.ttsEnabled) {
+                        Text(
+                            "🔊 TTS",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = g.emerald,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    GamePillBadge(
+                        text = "단원 목록",
+                        containerColor = g.violetSoft,
+                        contentColor = g.violet,
+                        icon = Icons.Default.FormatListNumbered,
+                        onClick = onOpenUnits
                     )
                 }
             }

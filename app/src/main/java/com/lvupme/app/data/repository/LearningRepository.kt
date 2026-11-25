@@ -47,8 +47,20 @@ data class SubjectDashboardItem(
     val completedUnits: Int,
     val totalUnits: Int,
     val totalCards: Int,
-    val weakCardsCount: Int
+    val weakCardsCount: Int,
+    val activeUnitReadiness: Float = 0f,
+    val activeUnitTotalCards: Int = 0
 )
+
+data class UnitProgressItem(
+    val unit: CurriculumUnitEntity,
+    val totalCards: Int,
+    val practicedCards: Int,
+    val weakCards: Int
+) {
+    val readiness: Float
+        get() = if (totalCards > 0) (practicedCards.toFloat() / totalCards.toFloat()).coerceIn(0f, 1f) else 0f
+}
 
 data class WeakCardItem(
     val subjectName: String,
@@ -59,7 +71,10 @@ data class WeakCardItem(
 data class UnitReadiness(
     val unit: CurriculumUnitEntity?,
     val readiness: Float,
-    val allUnitsCompleted: Boolean = false
+    val practicedCards: Int = 0,
+    val totalCards: Int = 0,
+    val allUnitsCompleted: Boolean = false,
+    val isFocusUnitReview: Boolean = false
 )
 
 data class StudyHistorySnapshot(
@@ -129,10 +144,12 @@ class LearningRepository(
             db.subjectDao().observeAll(),
             db.curriculumDao().observeAll(),
             db.cardDao().observeAll(),
+            db.quizDao().observeAll(),
             db.reviewDao().observeAll()
-        ) { subjects, allUnits, allCards, allStates ->
+        ) { subjects, allUnits, allCards, allQuestions, allStates ->
             val unitsBySubject = allUnits.groupBy { it.subjectId }
             val cardsBySubject = allCards.groupBy { it.subjectId }
+            val questionCardIds = allQuestions.mapTo(HashSet()) { it.cardId }
             val statesBySubject = allStates.groupBy { it.subjectId }
 
             subjects.map { subject ->
@@ -141,7 +158,15 @@ class LearningRepository(
                     ?: units.lastOrNull()
                 val cards = cardsBySubject[subject.id].orEmpty()
                 val states = statesBySubject[subject.id].orEmpty()
+                val statesByCard = states.associateBy { it.cardId }
                 val allDone = units.isNotEmpty() && units.all { it.status == UnitStatus.COMPLETED }
+                val activeUsableCards = if (activeUnit != null && !allDone) {
+                    cards.filter { it.unitId == activeUnit.id && it.id in questionCardIds }
+                } else emptyList()
+                val activeReadiness = if (activeUsableCards.isNotEmpty()) {
+                    activeUsableCards.count { (statesByCard[it.id]?.masteryLevel ?: 0) >= 1 }.toFloat() /
+                        activeUsableCards.size.toFloat()
+                } else 0f
                 SubjectDashboardItem(
                     subject = subject,
                     activeUnitTitle = when {
@@ -152,11 +177,38 @@ class LearningRepository(
                     completedUnits = units.count { it.status == UnitStatus.COMPLETED },
                     totalUnits = units.size,
                     totalCards = cards.size,
-                    weakCardsCount = states.count { it.isWeak }
+                    weakCardsCount = states.count { it.isWeak },
+                    activeUnitReadiness = activeReadiness,
+                    activeUnitTotalCards = activeUsableCards.size
                 )
             }
         }
     }
+
+    fun observeUnitProgressList(subjectId: Long): Flow<List<UnitProgressItem>> {
+        return combine(
+            db.curriculumDao().observeUnits(subjectId),
+            db.cardDao().observeBySubject(subjectId),
+            db.quizDao().observeBySubject(subjectId),
+            db.reviewDao().observeBySubject(subjectId)
+        ) { units, cards, questions, states ->
+            val cardsByUnit = cards.groupBy { it.unitId }
+            val questionCardIds = questions.mapTo(HashSet()) { it.cardId }
+            val statesByCard = states.associateBy { it.cardId }
+            units.map { unit ->
+                val unitUsableCards = cardsByUnit[unit.id].orEmpty().filter { it.id in questionCardIds }
+                val unitStates = unitUsableCards.mapNotNull { statesByCard[it.id] }
+                UnitProgressItem(
+                    unit = unit,
+                    totalCards = unitUsableCards.size,
+                    practicedCards = unitUsableCards.count { (statesByCard[it.id]?.masteryLevel ?: 0) >= 1 },
+                    weakCards = unitStates.count { it.isWeak }
+                )
+            }
+        }
+    }
+
+    suspend fun getUnitById(unitId: Long): CurriculumUnitEntity? = db.curriculumDao().getById(unitId)
 
     fun observeWeakCards(): Flow<List<WeakCardItem>> {
         return db.reviewDao().observeWeakCardsJoined().map { rows ->
@@ -275,27 +327,37 @@ class LearningRepository(
     }
 
     suspend fun ensureActiveUnitPrefetched(subjectId: Long): Int = prefetchMutex.withLock {
-        val subject = db.subjectDao().getById(subjectId) ?: return@withLock 0
         val activeUnit = db.curriculumDao().getActiveUnit(subjectId) ?: return@withLock 0
-        val existingCards = db.cardDao().getByUnit(activeUnit.id)
-        if (activeUnit.isPrefetched && existingCards.isNotEmpty()) return@withLock existingCards.size
+        prefetchUnitLocked(subjectId, activeUnit)
+    }
+
+    suspend fun ensureUnitPrefetched(subjectId: Long, unitId: Long): Int = prefetchMutex.withLock {
+        val unit = db.curriculumDao().getById(unitId) ?: return@withLock 0
+        if (unit.subjectId != subjectId || unit.status == UnitStatus.LOCKED) return@withLock 0
+        prefetchUnitLocked(subjectId, unit)
+    }
+
+    private suspend fun prefetchUnitLocked(subjectId: Long, unit: CurriculumUnitEntity): Int {
+        val subject = db.subjectDao().getById(subjectId) ?: return 0
+        val existingCards = db.cardDao().getByUnit(unit.id)
+        if (unit.isPrefetched && existingCards.isNotEmpty()) return existingCards.size
 
         val batchSize = settingsRepository.getSettings().prefetchBatchSize
         val batch = geminiClient.generateUnitContentBatch(
             subject = subject.name,
             subTopic = subject.subTopic,
             userLevel = subject.userLevel,
-            unitTitle = activeUnit.title,
-            unitDescription = activeUnit.description,
+            unitTitle = unit.title,
+            unitDescription = unit.description,
             count = batchSize,
             existingTitles = existingCards.map { it.title }
         )
 
-        if (batch.cards.isEmpty()) return@withLock 0
-        saveGeneratedCards(subject.id, activeUnit, batch.cards)
-        db.curriculumDao().update(activeUnit.copy(isPrefetched = true))
+        if (batch.cards.isEmpty()) return 0
+        saveGeneratedCards(subject.id, unit, batch.cards)
+        db.curriculumDao().update(unit.copy(isPrefetched = true))
         refreshWidget()
-        batch.cards.size
+        return batch.cards.size
     }
 
     suspend fun prefetchUpcomingForAllSubjects(): Int = prefetchMutex.withLock {
@@ -399,10 +461,19 @@ class LearningRepository(
         recentCardIds: List<Long>,
         recentQuestionTypes: List<String>,
         recentPastCardIds: List<Long> = emptyList(),
-        pinnedCardId: Long? = null
+        pinnedCardId: Long? = null,
+        focusUnitId: Long? = null,
+        sessionCoveredCardIds: Set<Long> = emptySet()
     ): ScheduledQuestion? {
         val units = db.curriculumDao().getUnits(subjectId)
-        val activeUnit = units.firstOrNull { it.status == UnitStatus.ACTIVE }
+        if (units.isEmpty()) return null
+
+        val allDone = units.all { it.status == UnitStatus.COMPLETED }
+        val focusedUnit = focusUnitId?.let { id ->
+            units.firstOrNull { it.id == id && it.status != UnitStatus.LOCKED }
+        }
+        val activeUnit = focusedUnit
+            ?: units.firstOrNull { it.status == UnitStatus.ACTIVE }
             ?: units.lastOrNull()
             ?: return null
 
@@ -424,6 +495,9 @@ class LearningRepository(
         }
 
         val settings = settingsRepository.getSettings()
+        val isFocusUnitOnly = focusedUnit != null && focusedUnit.status == UnitStatus.COMPLETED
+        val isReviewAll = focusedUnit == null && allDone
+
         return scheduler.selectNextQuestion(
             activeUnitId = activeUnit.id,
             activeUnitOrder = activeUnit.orderIndex,
@@ -434,7 +508,10 @@ class LearningRepository(
             sessionIndex = sessionIndex,
             recentCardIds = recentCardIds,
             recentQuestionTypes = recentQuestionTypes,
-            recentPastCardIds = recentPastCardIds
+            recentPastCardIds = recentPastCardIds,
+            focusUnitOnly = isFocusUnitOnly,
+            reviewAllUnits = isReviewAll,
+            sessionCoveredCardIds = sessionCoveredCardIds
         )
     }
 
@@ -560,20 +637,62 @@ class LearningRepository(
         return true
     }
 
-    suspend fun getUnitReadiness(subjectId: Long): UnitReadiness {
+    suspend fun getUnitReadiness(subjectId: Long, targetUnitId: Long? = null): UnitReadiness {
         val units = db.curriculumDao().getUnits(subjectId)
         if (units.isEmpty()) return UnitReadiness(null, 0f, allUnitsCompleted = false)
 
-        val activeUnit = units.firstOrNull { it.status == UnitStatus.ACTIVE }
-        if (activeUnit == null) {
-            val allDone = units.all { it.status == UnitStatus.COMPLETED }
-            return UnitReadiness(units.lastOrNull(), if (allDone) 1f else 0f, allUnitsCompleted = allDone)
+        val allDone = units.all { it.status == UnitStatus.COMPLETED }
+
+        if (targetUnitId != null) {
+            val targetUnit = units.firstOrNull { it.id == targetUnitId && it.status != UnitStatus.LOCKED }
+            if (targetUnit != null) {
+                val unitCards = db.cardDao().getByUnit(targetUnit.id)
+                val questionsByCard = db.quizDao().getByUnit(targetUnit.id).groupBy { it.cardId }
+                val usableCards = unitCards.filter { !questionsByCard[it.id].isNullOrEmpty() }
+                val statesByCard = db.reviewDao().getByUnit(subjectId, targetUnit.id).associateBy { it.cardId }
+                val total = usableCards.size
+                val practiced = usableCards.count { (statesByCard[it.id]?.masteryLevel ?: 0) >= 1 }
+                val ratio = if (total > 0) practiced.toFloat() / total.toFloat() else 0f
+                return UnitReadiness(
+                    unit = targetUnit,
+                    readiness = ratio,
+                    practicedCards = practiced,
+                    totalCards = total,
+                    allUnitsCompleted = allDone,
+                    isFocusUnitReview = targetUnit.status == UnitStatus.COMPLETED
+                )
+            }
         }
 
-        val states = db.reviewDao().getByUnit(subjectId, activeUnit.id)
-        if (states.isEmpty()) return UnitReadiness(activeUnit, 0f, allUnitsCompleted = false)
-        val practiced = states.count { it.masteryLevel >= 1 }
-        return UnitReadiness(activeUnit, practiced.toFloat() / states.size.toFloat(), allUnitsCompleted = false)
+        val activeUnit = units.firstOrNull { it.status == UnitStatus.ACTIVE }
+        if (activeUnit == null) {
+            val allCards = db.cardDao().getBySubject(subjectId)
+            return UnitReadiness(
+                unit = units.lastOrNull(),
+                readiness = if (allDone) 1f else 0f,
+                practicedCards = if (allDone) allCards.size else 0,
+                totalCards = allCards.size,
+                allUnitsCompleted = allDone,
+                isFocusUnitReview = false
+            )
+        }
+
+        val unitCards = db.cardDao().getByUnit(activeUnit.id)
+        val questionsByCard = db.quizDao().getByUnit(activeUnit.id).groupBy { it.cardId }
+        val usableCards = unitCards.filter { !questionsByCard[it.id].isNullOrEmpty() }
+        val statesByCard = db.reviewDao().getByUnit(subjectId, activeUnit.id).associateBy { it.cardId }
+        if (usableCards.isEmpty()) {
+            return UnitReadiness(activeUnit, 0f, practicedCards = 0, totalCards = 0, allUnitsCompleted = false)
+        }
+        val practiced = usableCards.count { (statesByCard[it.id]?.masteryLevel ?: 0) >= 1 }
+        return UnitReadiness(
+            unit = activeUnit,
+            readiness = practiced.toFloat() / usableCards.size.toFloat(),
+            practicedCards = practiced,
+            totalCards = usableCards.size,
+            allUnitsCompleted = false,
+            isFocusUnitReview = false
+        )
     }
 
     suspend fun buildUnitCheckpointQuestions(subjectId: Long, unitId: Long): List<LevelTestQuestionDto> {
@@ -682,7 +801,7 @@ class LearningRepository(
             if (examType == ExamType.UNIT_CHECKPOINT && passed && unitId != null) {
                 val units = db.curriculumDao().getUnits(subjectId)
                 val current = units.firstOrNull { it.id == unitId }
-                if (current != null) {
+                if (current != null && current.status == UnitStatus.ACTIVE) {
                     db.curriculumDao().update(current.copy(status = UnitStatus.COMPLETED))
                     val next = units.firstOrNull { it.orderIndex == current.orderIndex + 1 }
                     if (next != null && next.status == UnitStatus.LOCKED) {
